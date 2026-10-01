@@ -1,0 +1,162 @@
+name: hello-world-1 Prod Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      deployment_id:
+        description: Mainline Deploy deployment id
+        required: false
+      app_commit_sha:
+        description: App commit SHA to checkout and deploy
+        required: false
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - .github/**
+
+run-name: ${{ github.event_name == 'workflow_dispatch' && format('Mainline deployment {0}', github.event.inputs.deployment_id) || format('Push deployment {0}', github.sha) }}
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1
+  ECS_CLUSTER: caw-aws-aps1-prod-ecs-md-cluster
+  ECR_REPOSITORY: caw-aws-aps1-prod-ecr-md-hello-world-1
+  ECS_SERVICE: caw-aws-aps1-prod-ecs-md-hello-world-1-service
+  TASK_NAME: caw-aws-aps1-prod-task_definition-md-hello-world-1
+  CONTAINER_NAME: caw-aws-aps1-prod-task_definition-md-hello-world-1-container
+  SERVICE_URL: https://hello-world-1.knacklabs.dev
+  MAINLINE_DEPLOY_URL: "https://mainline.knacklabs.dev"
+  DEPLOY_SHA: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.app_commit_sha || github.sha }}
+  
+
+jobs:
+  deploy:
+    name: Deploy to hello-world-1 Prod
+    runs-on: ubuntu-latest
+    environment: MD Prod
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-region: ap-south-1
+          role-to-assume: arn:aws:iam::939760948774:role/Admin-OIDC
+
+      - name: Notify Mainline Deploy (running)
+        if: env.MAINLINE_DEPLOY_URL != ''
+        continue-on-error: true
+        env:
+          MAINLINE_DEPLOY_URL: ${{ env.MAINLINE_DEPLOY_URL }}
+          MAINLINE_DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+          APP_COMMIT_SHA: ${{ env.DEPLOY_SHA }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          MAINLINE_DEPLOY_CALLBACK_TOKEN=$(aws ssm get-parameter --name /md/APP_PIPELINE_CALLBACK_TOKEN --with-decryption --query Parameter.Value --output text)
+          echo "::add-mask::$MAINLINE_DEPLOY_CALLBACK_TOKEN"
+          payload="$(python3 - <<'PY'
+          import json
+          import os
+
+          body = {
+              "status": "running",
+              "app_commit_sha": os.environ["APP_COMMIT_SHA"],
+              "workflow_run_url": os.environ["RUN_URL"],
+          }
+          deployment_id = os.environ.get("MAINLINE_DEPLOYMENT_ID", "").strip()
+          if deployment_id:
+              body["deployment_id"] = deployment_id
+
+          print(json.dumps(body))
+          PY
+          )"
+          endpoint="${MAINLINE_DEPLOY_URL%/}/api/webhooks/app-pipeline"
+          curl -sf -X POST "$endpoint" \
+            -H "Authorization: Bearer $MAINLINE_DEPLOY_CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload"
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ env.DEPLOY_SHA }}
+        run: |
+          docker build \
+          -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Dockerfile .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Download task definition
+        run: aws ecs describe-task-definition --task-definition ${{ env.TASK_NAME }} --query taskDefinition > task-definition.json
+
+      - name: Fill in the new image ID in the Amazon ECS task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ steps.build-image.outputs.image }}
+
+      - name: Deploy Amazon ECS task definition
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+          wait-max-delay-seconds: 15
+          
+
+      - name: Notify Mainline Deploy
+        if: always() && env.MAINLINE_DEPLOY_URL != ''
+        continue-on-error: true
+        env:
+          MAINLINE_DEPLOY_URL: ${{ env.MAINLINE_DEPLOY_URL }}
+          MAINLINE_DEPLOYMENT_ID: ${{ github.event.inputs.deployment_id }}
+          APP_COMMIT_SHA: ${{ env.DEPLOY_SHA }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SERVICE_URL: ${{ env.SERVICE_URL }}
+        run: |
+          MAINLINE_DEPLOY_CALLBACK_TOKEN=$(aws ssm get-parameter --name /md/APP_PIPELINE_CALLBACK_TOKEN --with-decryption --query Parameter.Value --output text)
+          echo "::add-mask::$MAINLINE_DEPLOY_CALLBACK_TOKEN"
+          STATUS=success
+          if [ "${{ job.status }}" != "success" ]; then STATUS=failed; fi
+          export STATUS
+          payload="$(python3 - <<'PY'
+          import json
+          import os
+
+          body = {
+              "status": os.environ["STATUS"],
+              "app_commit_sha": os.environ["APP_COMMIT_SHA"],
+              "workflow_run_url": os.environ["RUN_URL"],
+          }
+          deployment_id = os.environ.get("MAINLINE_DEPLOYMENT_ID", "").strip()
+          if deployment_id:
+              body["deployment_id"] = deployment_id
+          service_url = os.environ.get("SERVICE_URL", "").strip()
+          if service_url:
+              body["service_url"] = service_url
+
+          print(json.dumps(body))
+          PY
+          )"
+          endpoint="${MAINLINE_DEPLOY_URL%/}/api/webhooks/app-pipeline"
+          curl -sf -X POST "$endpoint" \
+            -H "Authorization: Bearer $MAINLINE_DEPLOY_CALLBACK_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$payload"
