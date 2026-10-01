@@ -1,9 +1,11 @@
-FROM node:latest as Builder
-COPY . /app
-WORKDIR /app
-RUN npm install --global pkg
-RUN pkg -t node16-linux-x64 app.js
+FROM node:22-alpine
 
-FROM alpine:latest
-COPY --from=Builder /app .
-CMD  ./app-linux
+WORKDIR /app
+COPY --chown=node:node app.js ./app.js
+
+ENV NODE_ENV=production
+ENV PORT=8080
+EXPOSE 8080
+
+USER node
+CMD ["node", "app.js"]
